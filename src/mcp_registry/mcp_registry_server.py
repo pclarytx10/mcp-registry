@@ -1,13 +1,14 @@
+import base64
 import time
 from flask import Flask, request, jsonify
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List, Any
 import socket
 import random
 import json
 import requests
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Thread
 
 from fastmcp_http.client import FastMCPHttpClient
@@ -30,6 +31,10 @@ health_cache: Dict[str, tuple[datetime, bool]] = {}
 
 # Add constants for storage
 STORAGE_FILE = Path("servers.json")
+KNOWN_SERVERS_FILE = Path("known_servers.json")
+
+# Known servers loaded from fixed JSON (MCP Registry ServerResponse format)
+known_servers_list: List[Dict[str, Any]] = []
 
 # Add constant for permission server name
 PERMISSION_SERVER_NAME = "PermissionServer"
@@ -117,6 +122,61 @@ def load_servers() -> Dict[str, Server]:
     return servers
 
 
+def load_known_servers() -> List[Dict[str, Any]]:
+    """Load known servers from fixed JSON file. Returns empty list if missing."""
+    global known_servers_list
+    if not KNOWN_SERVERS_FILE.exists():
+        known_servers_list = []
+        return known_servers_list
+    try:
+        with open(KNOWN_SERVERS_FILE, "r") as f:
+            data = json.load(f)
+            known_servers_list = data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"Error loading known servers: {e}")
+        known_servers_list = []
+    return known_servers_list
+
+
+def _dynamic_to_server_response(server: Server) -> Dict[str, Any]:
+    """Convert a dynamically registered server to MCP Registry ServerResponse format."""
+    base_url = f"{server.url.rstrip('/')}:{server.port}"
+    if not base_url.startswith("http"):
+        base_url = f"http://{base_url}"
+    return {
+        "_meta": {
+            "io.modelcontextprotocol.registry/official": {
+                "status": "active",
+                "isLatest": True,
+                "publishedAt": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "updatedAt": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "statusChangedAt": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        },
+        "server": {
+            "name": f"local/{server.name}".replace(" ", "-"),
+            "description": server.description,
+            "version": "1.0.0",
+            "title": server.name,
+            "remotes": [
+                {
+                    "type": "streamable-http",
+                    "url": f"{base_url}/sse",
+                }
+            ],
+        },
+    }
+
+
+def _get_v01_servers() -> List[Dict[str, Any]]:
+    """Build combined list of known + dynamic servers for v0.1 endpoint."""
+    combined = list(known_servers_list)
+    for s in servers.values():
+        if s.name != PERMISSION_SERVER_NAME and check_server_health(s):
+            combined.append(_dynamic_to_server_response(s))
+    return combined
+
+
 def save_servers():
     """Save current servers to storage."""
     with open(STORAGE_FILE, "w") as f:
@@ -165,6 +225,97 @@ def register_server():
         ),
         201,
     )
+
+
+@app.route("/v0.1/servers", methods=["GET"])
+def list_servers_v01():
+    """MCP Registry-compatible paginated list of servers."""
+    limit = min(100, max(1, request.args.get("limit", 30, type=int)))
+    cursor = request.args.get("cursor", "")
+    search = request.args.get("search", "").strip().lower()
+    updated_since = request.args.get("updated_since", "")
+    version_filter = request.args.get("version", "")
+    include_deleted = request.args.get("include_deleted", "false").lower() == "true"
+    if updated_since:
+        include_deleted = True  # Per spec: always true when updated_since is provided
+
+    all_servers = _get_v01_servers()
+
+    # Filter by search (substring on server.name)
+    if search:
+        all_servers = [
+            s for s in all_servers
+            if search in s.get("server", {}).get("name", "").lower()
+        ]
+
+    # Filter by updated_since
+    if updated_since:
+        try:
+            since_dt = datetime.fromisoformat(updated_since.replace("Z", "+00:00"))
+            all_servers = [
+                s for s in all_servers
+                if _parse_meta_updated_at(s) >= since_dt
+            ]
+        except (ValueError, TypeError):
+            pass
+
+    # Filter by version
+    if version_filter and version_filter != "latest":
+        all_servers = [
+            s for s in all_servers
+            if s.get("server", {}).get("version") == version_filter
+        ]
+    elif version_filter == "latest":
+        # Keep only latest per server name (isLatest or first occurrence)
+        seen = {}
+        for s in all_servers:
+            name = s.get("server", {}).get("name", "")
+            meta = s.get("_meta", {}).get("io.modelcontextprotocol.registry/official", {})
+            if meta.get("isLatest", True) and name not in seen:
+                seen[name] = s
+        all_servers = list(seen.values())
+
+    # Filter deleted unless include_deleted
+    if not include_deleted:
+        all_servers = [
+            s for s in all_servers
+            if s.get("_meta", {}).get("io.modelcontextprotocol.registry/official", {}).get("status") != "deleted"
+        ]
+
+    # Decode cursor to get offset
+    offset = 0
+    if cursor:
+        try:
+            decoded = json.loads(base64.b64decode(cursor).decode())
+            offset = decoded.get("offset", 0)
+        except Exception:
+            offset = 0
+
+    # Paginate
+    page = all_servers[offset : offset + limit]
+    next_offset = offset + limit
+    next_cursor = None
+    if next_offset < len(all_servers):
+        next_cursor = base64.b64encode(json.dumps({"offset": next_offset}).encode()).decode()
+
+    return jsonify({
+        "metadata": {
+            "count": len(page),
+            "nextCursor": next_cursor,
+        },
+        "servers": page,
+    })
+
+
+def _parse_meta_updated_at(entry: Dict[str, Any]) -> datetime:
+    """Parse updatedAt from _meta, default to epoch."""
+    try:
+        ts = entry.get("_meta", {}).get("io.modelcontextprotocol.registry/official", {}).get("updatedAt", "")
+        if ts:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        pass
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 @app.route("/servers", methods=["GET"])
@@ -300,6 +451,9 @@ def load_permission_server():
 def run():
     # Register permission server first
     load_permission_server()
+
+    # Load known servers from fixed JSON
+    load_known_servers()
 
     # Load other servers on startup
     loaded_servers = load_servers()

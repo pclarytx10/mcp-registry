@@ -1,0 +1,19 @@
+[
+  {
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "isLatest": true,
+        "publishedAt": "2025-01-01T00:00:00Z",
+        "updatedAt": "2025-01-01T00:00:00Z",
+        "statusChangedAt": "2025-01-01T00:00:00Z"
+      }
+    },
+    "server": {
+      "name": "io.example/my-server",
+      "description": "Example MCP server",
+      "version": "1.0.0",
+      "title": "My Server"
+    }
+  }
+]
